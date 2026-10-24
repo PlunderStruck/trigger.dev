@@ -385,6 +385,133 @@ describe("RunEngine heartbeats", () => {
     }
   );
 
+  containerTest(
+    "Execution timeout still fires after the run lock was held past the default retry budget",
+    async ({ prisma, redisOptions }) => {
+      const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+
+      //long enough that the heartbeat job from startRunAttempt doesn't fire before the test replaces it
+      const executingTimeout = 2_000;
+
+      const engine = new RunEngine({
+        prisma,
+        worker: {
+          redis: redisOptions,
+          workers: 1,
+          tasksPerWorker: 10,
+          pollIntervalMs: 100,
+        },
+        queue: {
+          redis: redisOptions,
+          masterQueueConsumersDisabled: true,
+          processWorkerQueueDebounceMs: 50,
+        },
+        runLock: {
+          redis: redisOptions,
+          //give up on a held lock quickly instead of after 15s
+          retryConfig: {
+            maxAttempts: 2,
+            baseDelay: 50,
+            maxDelay: 50,
+            maxTotalWaitTime: 200,
+          },
+        },
+        machines: {
+          defaultMachine: "small-1x",
+          machines: {
+            "small-1x": {
+              name: "small-1x" as const,
+              cpu: 0.5,
+              memory: 0.5,
+              centsPerMs: 0.0001,
+            },
+          },
+          baseCostInCents: 0.0001,
+        },
+        heartbeatTimeoutsMs: {
+          EXECUTING: executingTimeout,
+        },
+        tracer: trace.getTracer("test", "0.0.0"),
+      });
+
+      try {
+        const taskIdentifier = "test-task";
+
+        //create background worker
+        await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
+
+        //trigger the run
+        const run = await engine.trigger(
+          {
+            number: 1,
+            friendlyId: "run_1234",
+            environment: authenticatedEnvironment,
+            taskIdentifier,
+            payload: "{}",
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "t12345",
+            spanId: "s12345",
+            workerQueue: "main",
+            queue: "task/test-task",
+            isTest: false,
+            tags: [],
+          },
+          prisma
+        );
+
+        await setTimeout(500);
+
+        //dequeue the run
+        const dequeued = await engine.dequeueFromWorkerQueue({
+          consumerId: "test_12345",
+          workerQueue: "main",
+        });
+
+        //create an attempt
+        const attempt = await engine.startRunAttempt({
+          runId: dequeued[0].run.id,
+          snapshotId: dequeued[0].snapshot.id,
+        });
+        expect(attempt.snapshot.executionStatus).toBe("EXECUTING");
+
+        const worker = (engine as any).worker;
+        const jobId = `heartbeatSnapshot.${run.id}`;
+
+        //hold the run lock the way a hung attempt completion would
+        await (engine as any).runLock.lock("test-holder", [run.id], async () => {
+          //the heartbeat job has already failed 11 times, so this failure exhausts the
+          //default budget of 12 attempts without waiting hours of backoff
+          await worker.queue.enqueue({
+            id: jobId,
+            job: "heartbeatSnapshot",
+            item: { runId: run.id, snapshotId: attempt.snapshot.id },
+            attempt: 11,
+            visibilityTimeoutMs: 30_000,
+          });
+
+          //the stall handler can't get the lock, so it fails
+          await setTimeout(1_000);
+
+          expect(await worker.queue.sizeOfDeadLetterQueue()).toBe(0);
+          expect((await worker.getJob(jobId))?.attempt).toBe(12);
+        });
+
+        //the lock is free, so bring the retry forward instead of waiting out its backoff
+        await worker.reschedule(jobId, new Date());
+        await setTimeout(1_000);
+
+        //the stall handler failed the attempt and requeued the run
+        const executionData = await engine.getRunExecutionData({ runId: run.id });
+        assertNonNullable(executionData);
+        expect(executionData.snapshot.executionStatus).toBe("QUEUED");
+      } finally {
+        await engine.quit();
+      }
+    }
+  );
+
   containerTest("Pending cancel", async ({ prisma, redisOptions }) => {
     const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
 

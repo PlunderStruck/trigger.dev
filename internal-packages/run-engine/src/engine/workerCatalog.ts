@@ -15,6 +15,13 @@ export const workerCatalog = {
       restartAttempt: z.number().optional(),
     }),
     visibilityTimeoutMs: 30_000,
+    // Fails an EXECUTING run whose attempt completion never arrived. Dead-lettering it would leave
+    // the run EXECUTING indefinitely, so it gets the same retry budget as ensureRunFinalized.
+    retry: {
+      maxAttempts: 10_000,
+      minTimeoutInMs: 1_000,
+      maxTimeoutInMs: 300_000,
+    },
   },
   repairSnapshot: {
     schema: z.object({
