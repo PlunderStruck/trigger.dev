@@ -1428,6 +1428,9 @@ export class RunAttemptSystem {
         orgId,
         messageId: run.id,
         retryAt: timestamp,
+        // A resume is enqueued at the run's original position, so a resume that fails before the
+        // run continues keeps it there instead of moving behind runs triggered after it.
+        keepQueuePosition: checkpointId !== undefined,
         resetAttemptCount: resetQueueAttempts,
         workerQueue: moveToWorkerQueue ?? workerQueue,
       });
